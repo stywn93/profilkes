@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.DS_Store
+
+web/node_modules/
+web/dist/
+web/.flowbite-react/class-list.json
+
+server/node_modules/
