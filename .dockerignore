@@ -1,0 +1,9 @@
+.git
+.freebuff
+.venv
+**/node_modules
+**/dist
+web/.flowbite-react
+**/__pycache__
+*.xlsx
+*.log

@@ -226,9 +226,13 @@ app.setErrorHandler<FastifyError>((error, request, reply) => {
 });
 
 const port = Number(process.env.PORT ?? 8787);
+// Loopback by default so a local `npm run dev` is not exposed on the LAN.
+// Containers set HOST=0.0.0.0, otherwise the published port has nothing to
+// forward to.
+const host = process.env.HOST ?? "127.0.0.1";
 
 app
-  .listen({ port, host: "127.0.0.1" })
+  .listen({ port, host })
   .then((address) => app.log.info(`API listening on ${address}`))
   .catch((error) => {
     app.log.error(error);

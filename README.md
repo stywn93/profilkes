@@ -8,10 +8,15 @@ Kabupaten Situbondo, 2025). Scope for this pass: **Angka Kematian Ibu (AKI)** an
 db/00_reset.sql                 drops every object (dev only)
 db/01_schema.sql                dims, facts, import provenance
 db/02_views.sql                 AKI/AKB marts + Wilson confidence intervals
+db/03_public_views.sql          flat aliases in public, for ad-hoc querying
+scripts/init_db.py              schema + views + load, in one command
 scripts/load_profilkes.py       workbook -> PostgreSQL loader (idempotent, reconciles)
 scripts/verify.sql              12 invariant checks, exits non-zero on failure
+docker/                         images for the api, the dashboard and the loader
+docker-compose.yml              the whole stack: db, loader, api, web, verify
 server/                         read-only JSON API over the marts (Fastify + pg)
 web/                            dashboard (Vite + React + TypeScript + Flowbite)
+Makefile                        make up / make dev / make verify / ...
 ```
 
 ## Model
@@ -100,6 +105,20 @@ Marts (`db/02_views.sql`):
 | `mart.child_death_cause` | neonatal and child (12–59 month) cause breakdown + share |
 | `mart.live_births_by_region` | shared denominator, including stillbirths |
 | `dim.region_ancestry` | region → every ancestor, drives all rollups |
+
+`db/03_public_views.sql` re-exports the same objects into `public` as
+`public.v_aki`, `public.v_akb`, `public.v_kpi_summary`, `public.v_region_aki_akb`
+and `public.v_fact_*`. They are views, not tables: they store nothing, so a
+number cannot drift from the mart behind it. The reason they exist is that
+database GUIs and spreadsheet connectors list the `public` schema and nothing
+else, which makes the database look empty.
+
+The `v_` prefix is a naming convention, not a PostgreSQL rule: `v_` reads as
+"view" next to the tables, which keep their plain names. Every view in
+`public` carries an `INSTEAD OF` trigger that rejects writes, because a
+PostgreSQL view over a single table is otherwise updatable and an accidental
+edit in a GUI would reach into the fact tables. Counts can only change through
+the loader, which reconciles them against the workbook.
 
 ## Grain
 
@@ -206,6 +225,48 @@ Dashboard-ready detail:
 
 ## Run it
 
+### Everything in Docker (recommended)
+
+```bash
+make up          # docker compose up --build -d
+```
+
+That builds three small images and starts five services:
+
+| Service | What it does | Address |
+|---|---|---|
+| `db` | Postgres 16 | `127.0.0.1:55432` |
+| `loader` | one-shot: applies the schema, builds the marts, loads the workbook | — |
+| `api` | Fastify | `127.0.0.1:8787` |
+| `web` | Vite dashboard, `/api` proxied to `api` | `127.0.0.1:5173` |
+| `verify` | one-shot: the 12 invariant checks | — |
+
+Open <http://127.0.0.1:5173>. The `api` and `web` services wait for the
+loader to finish, so the dashboard never shows an empty database. Dependencies
+are baked into the images; `node_modules` lives in named volumes, so the
+container never writes into your working tree.
+
+```bash
+make logs        # follow the logs
+make verify      # re-run the 12 invariant checks
+make reload      # re-apply the schema and re-load the workbook
+make reset       # drop everything and rebuild from the workbook
+make down        # stop the stack
+```
+
+### Local dev servers
+
+Run the database in Docker, the API and the dashboard on the host:
+
+```bash
+make db                                   # Postgres on 127.0.0.1:55432
+make venv                                 # .venv + openpyxl + psycopg
+make init                                 # schema + views + load
+make dev                                  # api on :8787, dashboard on :5173
+```
+
+Or by hand:
+
 ```bash
 # 1. Postgres 16 in docker (host port 55432)
 docker run -d --name profilkes-pg \
@@ -216,24 +277,102 @@ docker run -d --name profilkes-pg \
 python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
 
 # 3. Schema, views, data
-docker exec -i profilkes-pg psql -U postgres -d profilkes -f - < db/01_schema.sql
-docker exec -i profilkes-pg psql -U postgres -d profilkes -f - < db/02_views.sql
-.venv/bin/python scripts/load_profilkes.py profilkes_2025.xlsx
+.venv/bin/python scripts/init_db.py
 
 # 4. Invariants
 docker exec -i profilkes-pg psql -U postgres -d profilkes -f - < scripts/verify.sql
+
+# 5. API and dashboard
+cd server && npm install && npm run dev
+cd web && npm install && npm run dev
 ```
 
 Other database:
 
 ```bash
 DATABASE_URL=postgresql://user:pass@host:5432/db \
-  .venv/bin/python scripts/load_profilkes.py profilkes_2025.xlsx
+  .venv/bin/python scripts/init_db.py
 ```
 
 The loader prints a reconciliation table; it exits non-zero and commits nothing
 if any check fails. `db/01_schema.sql` is additive, so re-running is safe;
 `db/00_reset.sql` rebuilds from scratch.
+
+### Configuration
+
+| Variable | Default | Used by |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:55432/profilkes` | API, loader |
+| `HOST` / `PORT` | `127.0.0.1` / `8787` | API |
+| `VITE_HOST` / `VITE_PORT` | `127.0.0.1` / `5173` | dashboard |
+| `API_ORIGIN` | `http://127.0.0.1:8787` | the `/api` proxy of the dashboard |
+| `VITE_POLLING=1` | off | dashboard, for bind mounts that do not deliver file events |
+
+Both servers bind to loopback by default so a local run is not exposed on the
+LAN. The compose file sets `HOST=0.0.0.0` and `VITE_HOST=0.0.0.0`, because a
+published Docker port has nothing to forward to otherwise.
+
+### Inspecting the data
+
+The database is a plain Postgres 16 on the host:
+
+| | |
+|---|---|
+| Host | `127.0.0.1` |
+| Port | `55432` (published by the `db` container) |
+| Database | `profilkes` |
+| User / password | `postgres` / `postgres` |
+| SSL | **off** — the container has no certificate |
+| DSN | `postgresql://postgres:postgres@127.0.0.1:55432/profilkes` |
+
+Set the SSL mode to `disable` or `prefer`. A client that insists on `require`
+fails with *server does not support SSL* even though the database is running.
+
+There is no `psql` on the host by default, so use the one in the container:
+
+```bash
+make psql            # interactive psql on the database
+make tables          # every table and view with its row count
+make export          # export/*.csv, one file per table and view
+make dump            # export/profilkes.sql, the whole database as SQL
+```
+
+`make export` is the quickest way to look at the numbers in Excel or Numbers;
+`make dump` restores into any other Postgres with `psql -d other -f export/profilkes.sql`.
+
+The four schemas are `dim` (region, period, cause, age band), `etl` (import
+provenance), `fact` (the atomic counts) and `mart` (the derived rates the
+dashboard reads). A fifth schema, `public`, re-exports the same objects as
+`public.v_*` views, so a client that only lists `public` still sees
+everything:
+
+| View in `public` | Rows | What it is |
+|---|---|---|
+| `v_kpi_summary` | 1 | the headline figures of the dashboard |
+| `v_region_aki_akb` | 39 | one flat row per region: AKI, AKB, both intervals, all counts |
+| `v_aki` / `v_akb` | 39 each | one rate per region |
+| `v_akb_by_sex` | 78 | AKB split by sex |
+| `v_maternal_death_cause` | 273 | maternal causes with their share |
+| `v_child_death_cause` | 780 | neonatal and child causes with their share |
+| `v_fact_birth` | 40 | the raw counts, at puskesmas grain |
+| `v_regions`, `v_causes`, `v_import_batches` | 39 / 27 / 1 | dimensions and load history |
+
+If a GUI still shows nothing, right-click the connection and choose
+**Refresh** — clients cache the object list from the moment they connected.
+
+### When it does not start
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `curl: (7) Failed to connect to 127.0.0.1:8787` | the API is bound to loopback inside the container | `HOST=0.0.0.0` (the compose file already does this) |
+| the dashboard loads but every card is empty | the workbook was never loaded | `make reload` |
+| `Cannot reach the database` | Postgres is not running or not reachable | `make db`, then check `DATABASE_URL` |
+| a GUI client says *server does not support SSL* | the client asks for SSL `require` | set the SSL mode to `disable` or `prefer` |
+| a GUI client says *connection refused* on 5432 | the published port is 55432 | use port 55432, not 5432 |
+| `EADDRINUSE :5173` | something else holds the port | `VITE_PORT=5174 npm run dev` in `web/` |
+| the API answers but the dashboard shows an error | the proxy points at the wrong origin | `API_ORIGIN=http://api:8787` inside Docker, `http://127.0.0.1:8787` on the host |
+| `npm ci` fails in a container | the lockfile changed after the image was built | `make rebuild` |
+
 
 ## Dashboard
 
@@ -263,6 +402,9 @@ cd server && npm install && npm run dev
 # terminal 2: dashboard on 127.0.0.1:5173, /api proxied to the API
 cd web && npm install && npm run dev
 ```
+
+Or `make dev`, which runs both. Under Docker, `make up` runs the same two
+servers in containers.
 
 `npm run build` in `web/` type-checks and produces `web/dist`. Pages are lazy
 loaded, so ApexCharts (~270 kB gzipped) only downloads when a chart page opens.
